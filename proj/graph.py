@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 
 from typing import List, Literal, TypedDict
 
@@ -261,45 +262,52 @@ Fix the error completely. Do NOT use generic fallback titles like 'Overview of..
 Return the COMPLETE corrected chapter matching AIChapter schema.
 """
 
-    try:
-        chapter_obj = client.chat.completions.create(
-            model=STRUCTURING_MODEL,
-            response_model=AIChapter,
-            messages=[
-                {
-                    "role": "system",
-                    "content": SYSTEM_PROMPT,
-                },
-                {
-                    "role": "user",
-                    "content": user_message,
-                },
-            ],
-            temperature=0.1,
-            max_tokens=4096,
-            max_retries=3,
-        )
-    except Exception as e:
-        # Fallback to Mode.TOOLS if Mode.JSON failed
+    import time
+    for attempt in range(4):
         try:
-            groq_api_key = os.getenv("GROQ_API_KEY")
-            tools_client = instructor.from_groq(Groq(api_key=groq_api_key), mode=instructor.Mode.TOOLS)
-            chapter_obj = tools_client.chat.completions.create(
+            chapter_obj = client.chat.completions.create(
                 model=STRUCTURING_MODEL,
                 response_model=AIChapter,
                 messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_message},
+                    {
+                        "role": "system",
+                        "content": SYSTEM_PROMPT,
+                    },
+                    {
+                        "role": "user",
+                        "content": user_message,
+                    },
                 ],
                 temperature=0.1,
                 max_tokens=4096,
                 max_retries=3,
             )
-        except Exception as e2:
-            print(f"\nAI STRUCTURE EXTRACTION FAILED: {e2}")
-            raise RuntimeError(
-                f"Failed to extract real curriculum structure via Groq AI. Details: {e2}"
-            )
+            break
+        except Exception as e:
+            if "429" in str(e) or "rate_limit" in str(e).lower():
+                print(f"Rate limit hit on attempt {attempt+1}, sleeping 3.5 seconds...")
+                time.sleep(3.5)
+            elif attempt == 3:
+                # Fallback to Mode.TOOLS if Mode.JSON failed
+                try:
+                    groq_api_key = os.getenv("GROQ_API_KEY")
+                    tools_client = instructor.from_groq(Groq(api_key=groq_api_key), mode=instructor.Mode.TOOLS)
+                    chapter_obj = tools_client.chat.completions.create(
+                        model=STRUCTURING_MODEL,
+                        response_model=AIChapter,
+                        messages=[
+                            {"role": "system", "content": SYSTEM_PROMPT},
+                            {"role": "user", "content": user_message},
+                        ],
+                        temperature=0.1,
+                        max_tokens=4096,
+                        max_retries=3,
+                    )
+                except Exception as e2:
+                    print(f"\nAI STRUCTURE EXTRACTION FAILED: {e2}")
+                    raise RuntimeError(
+                        f"Failed to extract real curriculum structure via Groq AI. Details: {e2}"
+                    )
 
 
     chapter = AIChapter.model_validate(chapter_obj)
@@ -435,6 +443,7 @@ def structure_node(
         chapters.append(
             chapter
         )
+        time.sleep(2.0)
 
     state["chapters"] = chapters
 

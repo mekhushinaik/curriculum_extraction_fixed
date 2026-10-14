@@ -58,19 +58,38 @@ def validate_markdown_has_text(markdown: str, min_words: int = 30) -> None:
 
 def parse_with_docling(pdf_path: str) -> str:
     """
-    Parse PDF using docling document converter with OCR enabled.
-    Cleans out image placeholders and logs a 5000-char debug preview.
+    Parse PDF using fast pypdfium2 text extraction if digital text is present,
+    otherwise fallback to docling document converter.
     """
+    if not Path(pdf_path).exists():
+        raise FileNotFoundError(f"PDF file not found: {pdf_path}")
+
+    # 1. Fast digital text extraction via pypdfium2
+    try:
+        import pypdfium2 as pdfium
+        pdf = pdfium.PdfDocument(pdf_path)
+        pages_text = []
+        for i in range(len(pdf)):
+            page_t = pdf[i].get_textpage().get_text_range()
+            if page_t and page_t.strip():
+                pages_text.append(f"# Page {i+1}\n" + page_t.strip())
+        if pages_text:
+            fast_md = "\n\n<!-- PAGE_BREAK -->\n\n".join(pages_text)
+            cleaned_fast = clean_markdown_content(fast_md)
+            words = re.findall(r"\b[a-zA-Z0-9]{2,}\b", cleaned_fast)
+            if len(words) >= 100:
+                print(f"Successfully extracted {len(words)} words via fast pypdfium2 parser.")
+                return cleaned_fast
+    except Exception as e:
+        print(f"Fast pypdfium2 extraction skipped ({e}), falling back to Docling OCR...")
+
+    # 2. Fallback to Docling OCR
     from docling.datamodel.base_models import InputFormat
     from docling.datamodel.pipeline_options import PdfPipelineOptions
     from docling.document_converter import DocumentConverter, PdfFormatOption
 
-    if not Path(pdf_path).exists():
-        raise FileNotFoundError(f"PDF file not found: {pdf_path}")
-
-    # 1. Configure Docling with OCR enabled for scanned/layout PDF text extraction
     pipeline_options = PdfPipelineOptions()
-    pipeline_options.do_ocr = True
+    pipeline_options.do_ocr = False  # disable heavy neural OCR unless needed
     pipeline_options.do_table_structure = True
 
     converter = DocumentConverter(
@@ -78,28 +97,12 @@ def parse_with_docling(pdf_path: str) -> str:
             InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
         }
     )
-
-    # 2. Convert document
     result = converter.convert(pdf_path)
-
-    # 3. Export to raw markdown
     raw_markdown = result.document.export_to_markdown(
         page_break_placeholder="\n<!-- PAGE_BREAK -->\n"
     )
-
-    # 4. Clean image placeholders and artifacts immediately
     cleaned_markdown = clean_markdown_content(raw_markdown)
-
-    # 5. Validate content quality
     validate_markdown_has_text(cleaned_markdown, min_words=30)
-
-    # 6. Temporary debugging output showing first 5000 characters
-    print("\n" + "=" * 60)
-    print("DEBUG: EXTRACTED MARKDOWN (First 5000 chars):")
-    print("=" * 60)
-    print(cleaned_markdown[:5000])
-    print("=" * 60 + "\n")
-
     return cleaned_markdown
 
 
