@@ -44,6 +44,9 @@ MAX_RETRIES = 3
 
 STRUCTURING_MODEL = os.getenv("STRUCTURING_MODEL", "openai/gpt-oss-20b")
 
+# Safe maximum chars per single LLM call (~3000 tokens input, within Groq context window)
+CHARS_PER_LLM_CALL = 12000
+
 
 # ============================================================
 # GROQ CLIENT HELPER
@@ -131,6 +134,7 @@ class PipelineState(TypedDict, total=False):
 
     errors: List[str]
     retry_count: int
+    failed_indices: List[int]  # chapter indices (0-based) that failed validation
 
 
 # ============================================================
@@ -219,27 +223,39 @@ def clean_json_response(
 
 
 # ============================================================
-# STRUCTURE ONE CHAPTER
+# CONTENT SEGMENTATION HELPER
 # ============================================================
 
-def structure_one(
+def _split_content_into_segments(content: str, max_chars: int) -> List[str]:
+    """Split content into segments of at most max_chars, breaking at newline boundaries."""
+    if len(content) <= max_chars:
+        return [content]
+    segments = []
+    start = 0
+    while start < len(content):
+        end = start + max_chars
+        if end < len(content):
+            # Prefer splitting at a newline to avoid cutting mid-sentence
+            nl = content.rfind("\n", start, end)
+            if nl > start:
+                end = nl
+        segments.append(content[start:end].strip())
+        start = end
+    return [s for s in segments if s]
+
+
+# ============================================================
+# SINGLE-SEGMENT LLM CALL (exponential back-off on rate limits)
+# ============================================================
+
+def _call_llm_for_segment(
+    client,
     content: str,
     subject_slug: str,
     chapter_num: int,
     error_feedback: str = "",
 ) -> dict:
-
-    client = get_groq_client()
-
-    if client is None:
-        raise RuntimeError(
-            "GROQ_API_KEY environment variable is missing or empty. "
-            "Please set your Groq API key: $env:GROQ_API_KEY='your_api_key'"
-        )
-
-    # Limit chunk text length to 9000 chars to avoid model context / token limits
-    if len(content) > 9000:
-        content = content[:9000]
+    """Call Groq + Instructor for one content segment; returns AIChapter as dict."""
 
     user_message = f"""
 Subject: {subject_slug}
@@ -262,7 +278,6 @@ Fix the error completely. Do NOT use generic fallback titles like 'Overview of..
 Return the COMPLETE corrected chapter matching AIChapter schema.
 """
 
-    import time
     for attempt in range(4):
         try:
             chapter_obj = client.chat.completions.create(
@@ -282,16 +297,20 @@ Return the COMPLETE corrected chapter matching AIChapter schema.
                 max_tokens=4096,
                 max_retries=3,
             )
-            break
+            return AIChapter.model_validate(chapter_obj).model_dump()
         except Exception as e:
             if "429" in str(e) or "rate_limit" in str(e).lower():
-                print(f"Rate limit hit on attempt {attempt+1}, sleeping 3.5 seconds...")
-                time.sleep(3.5)
+                # Exponential back-off: 3.5s, 7s, 14s, 28s
+                backoff = 3.5 * (2 ** attempt)
+                print(f"  Rate limit hit (attempt {attempt + 1}), backing off {backoff:.1f}s...")
+                time.sleep(backoff)
             elif attempt == 3:
-                # Fallback to Mode.TOOLS if Mode.JSON failed
+                # Fallback to Mode.TOOLS if Mode.JSON failed on final attempt
                 try:
                     groq_api_key = os.getenv("GROQ_API_KEY")
-                    tools_client = instructor.from_groq(Groq(api_key=groq_api_key), mode=instructor.Mode.TOOLS)
+                    tools_client = instructor.from_groq(
+                        Groq(api_key=groq_api_key), mode=instructor.Mode.TOOLS
+                    )
                     chapter_obj = tools_client.chat.completions.create(
                         model=STRUCTURING_MODEL,
                         response_model=AIChapter,
@@ -303,16 +322,75 @@ Return the COMPLETE corrected chapter matching AIChapter schema.
                         max_tokens=4096,
                         max_retries=3,
                     )
+                    return AIChapter.model_validate(chapter_obj).model_dump()
                 except Exception as e2:
                     print(f"\nAI STRUCTURE EXTRACTION FAILED: {e2}")
                     raise RuntimeError(
                         f"Failed to extract real curriculum structure via Groq AI. Details: {e2}"
                     )
 
+    raise RuntimeError(f"Chapter {chapter_num}: LLM call failed after all retries.")
 
-    chapter = AIChapter.model_validate(chapter_obj)
 
-    return chapter.model_dump()
+# ============================================================
+# STRUCTURE ONE CHAPTER  (large chapters processed in segments)
+# ============================================================
+
+def structure_one(
+    content: str,
+    subject_slug: str,
+    chapter_num: int,
+    error_feedback: str = "",
+) -> dict:
+
+    client = get_groq_client()
+
+    if client is None:
+        raise RuntimeError(
+            "GROQ_API_KEY environment variable is missing or empty. "
+            "Please set your Groq API key: $env:GROQ_API_KEY='your_api_key'"
+        )
+
+    # If content fits in one LLM call, process it directly
+    if len(content) <= CHARS_PER_LLM_CALL:
+        return _call_llm_for_segment(
+            client, content, subject_slug, chapter_num, error_feedback
+        )
+
+    # Large chapter: split into sequential segments, merge topics
+    segments = _split_content_into_segments(content, CHARS_PER_LLM_CALL)
+    print(
+        f"  Chapter {chapter_num} is large ({len(content)} chars); "
+        f"processing {len(segments)} segments sequentially..."
+    )
+
+    merged = None
+    for seg_idx, segment in enumerate(segments):
+        if seg_idx > 0:
+            time.sleep(2.0)  # respect rate limits between segments
+        # Only pass error_feedback to the first segment (it applies to the chapter, not a segment)
+        seg_feedback = error_feedback if seg_idx == 0 else ""
+        try:
+            seg_result = _call_llm_for_segment(
+                client, segment, subject_slug, chapter_num, seg_feedback
+            )
+            if merged is None:
+                merged = seg_result
+            else:
+                # Accumulate topics from subsequent segments into the merged chapter
+                merged["topics"].extend(seg_result.get("topics", []))
+        except Exception as e:
+            print(
+                f"  Warning: segment {seg_idx + 1}/{len(segments)} of "
+                f"chapter {chapter_num} failed: {e}"
+            )
+
+    if merged is None:
+        raise RuntimeError(
+            f"All {len(segments)} segments of chapter {chapter_num} failed to process."
+        )
+
+    return merged
 
 
 # ============================================================
@@ -391,40 +469,45 @@ def add_ids_to_chapter(
 
 
 # ============================================================
-# STRUCTURE NODE
+# STRUCTURE NODE  (retries only failed chapters, not all chapters)
 # ============================================================
 
 def structure_node(
     state: PipelineState,
 ) -> PipelineState:
 
-    chapters = []
-    error_feedback = ""
+    error_feedback = (
+        state["errors"][-1]
+        if state.get("retry_count", 0) > 0 and state.get("errors")
+        else ""
+    )
 
-    if (
-        state.get("retry_count", 0) > 0
-        and state.get("errors")
-    ):
-        error_feedback = (
-            state["errors"][-1]
-        )
-
-    for i, chunk in enumerate(
-        state["chunks"],
-        start=1,
-    ):
+    # On retry: reprocess only the specific chapters that failed validation.
+    # This avoids wasting API quota by re-sending all chapters.
+    failed_indices = state.get("failed_indices", [])
+    if state.get("retry_count", 0) > 0 and failed_indices:
+        chapters = list(state.get("chapters", []))  # preserve good chapters
+        indices_to_process = failed_indices
         print(
-            f"Structuring chapter {i}..."
+            f"Retrying {len(failed_indices)} failed chapter(s): "
+            f"{[idx + 1 for idx in failed_indices]}"
         )
+    else:
+        chapters = []
+        indices_to_process = list(range(len(state["chunks"])))
+
+    for pos, chunk_idx in enumerate(indices_to_process):
+        i = chunk_idx + 1  # 1-based chapter number
+        chunk = state["chunks"][chunk_idx]
+
+        print(f"Structuring chapter {i}...")
 
         # ----------------------------------------------------
         # AI CREATES CHAPTER STRUCTURE
         # ----------------------------------------------------
         chapter = structure_one(
             content=chunk,
-            subject_slug=state[
-                "subject_slug"
-            ],
+            subject_slug=state["subject_slug"],
             chapter_num=i,
             error_feedback=error_feedback,
         )
@@ -434,16 +517,17 @@ def structure_node(
         # ----------------------------------------------------
         chapter = add_ids_to_chapter(
             chapter=chapter,
-            subject_slug=state[
-                "subject_slug"
-            ],
+            subject_slug=state["subject_slug"],
             chapter_num=i,
         )
 
-        chapters.append(
-            chapter
-        )
-        time.sleep(2.0)
+        if state.get("retry_count", 0) > 0 and failed_indices:
+            chapters[chunk_idx] = chapter  # patch only the failed slot in place
+        else:
+            chapters.append(chapter)
+
+        if pos < len(indices_to_process) - 1:
+            time.sleep(2.0)
 
     state["chapters"] = chapters
 
@@ -451,55 +535,40 @@ def structure_node(
 
 
 # ============================================================
-# VALIDATE NODE
+# VALIDATE NODE  (validates each chapter individually, tracks which ones failed)
 # ============================================================
 
 def validate_node(
     state: PipelineState,
 ) -> PipelineState:
 
-    try:
-        validated_chapters = []
+    validated_chapters = []
+    failed_indices: List[int] = []
+    new_errors: List[str] = []
 
-        for chapter in state["chapters"]:
-            validated = FinalChapter.model_validate(
-                chapter
-            )
-            validated_chapters.append(
-                validated.model_dump()
-            )
+    for idx, chapter in enumerate(state["chapters"]):
+        try:
+            validated = FinalChapter.model_validate(chapter)
+            validated_chapters.append(validated.model_dump())
+        except ValidationError as e:
+            print(f"Validation error in chapter {idx + 1}: {e}")
+            validated_chapters.append(chapter)  # preserve original for retry
+            failed_indices.append(idx)
+            new_errors.append(str(e))
 
-        state["chapters"] = validated_chapters
+    state["chapters"] = validated_chapters
+    state["failed_indices"] = failed_indices
+
+    if new_errors:
+        state["errors"] = state.get("errors", []) + new_errors
+        state["retry_count"] = state.get("retry_count", 0) + 1
+        print(
+            f"Validation completed: {len(failed_indices)} chapter(s) failed. "
+            f"Will retry chapters: {[idx + 1 for idx in failed_indices]}"
+        )
+    else:
         state["errors"] = []
-
-        print(
-            "Validation successful."
-        )
-
-    except ValidationError as e:
-        print(
-            "Validation error:"
-        )
-
-        print(e)
-
-        state["errors"] = (
-            state.get(
-                "errors",
-                []
-            )
-            + [
-                str(e)
-            ]
-        )
-
-        state["retry_count"] = (
-            state.get(
-                "retry_count",
-                0
-            )
-            + 1
-        )
+        print("Validation successful.")
 
     return state
 

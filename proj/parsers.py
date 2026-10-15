@@ -117,7 +117,7 @@ def chunk_markdown_by_chapter(markdown: str) -> List[str]:
 
     # Look for chapter/unit headings (e.g. # Chapter 3, ## Unit 1, # 3. Water Resources, etc.)
     heading_pattern = re.compile(
-        r"^(?:#{1,3}\s*)?(?:chapter|unit|\d+\.)\b",
+        r"^(?:#{1,3}\s*(?:chapter|unit|\d+\.)\b|(?:chapter|unit)\b)",
         re.IGNORECASE,
     )
 
