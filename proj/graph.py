@@ -44,8 +44,10 @@ MAX_RETRIES = 3
 
 STRUCTURING_MODEL = os.getenv("STRUCTURING_MODEL", "openai/gpt-oss-20b")
 
-# Safe maximum chars per single LLM call (~3000 tokens input, within Groq context window)
-CHARS_PER_LLM_CALL = 12000
+# Safe maximum chars per single LLM call.
+# Budget with TOOLS mode: ~648 sys + ~2000 content + ~600 schema + 2048 output = ~5296
+# Well within Groq free-tier 8000 TPM limit.
+CHARS_PER_LLM_CALL = 8000
 
 
 # ============================================================
@@ -56,7 +58,9 @@ def get_groq_client() -> instructor.Instructor | None:
     groq_api_key = os.getenv("GROQ_API_KEY")
     if not groq_api_key:
         return None
-    return instructor.from_groq(Groq(api_key=groq_api_key), mode=instructor.Mode.JSON)
+    # TOOLS mode (function calling) is more reliable than JSON mode for
+    # structured extraction on Groq — avoids json_validate_failed errors.
+    return instructor.from_groq(Groq(api_key=groq_api_key), mode=instructor.Mode.TOOLS)
 
 
 # ============================================================
@@ -227,9 +231,20 @@ def clean_json_response(
 # ============================================================
 
 def _split_content_into_segments(content: str, max_chars: int) -> List[str]:
-    """Split content into segments of at most max_chars, breaking at newline boundaries."""
+    """Split content into segments of at most max_chars, breaking at newline boundaries.
+    The first line (chapter heading) is prepended to every non-first segment so the
+    model always has chapter context and never returns empty output.
+    """
     if len(content) <= max_chars:
         return [content]
+
+    # Extract the chapter heading (first non-empty line) to use as context header
+    header_line = ""
+    for line in content.splitlines():
+        if line.strip():
+            header_line = line.rstrip()
+            break
+
     segments = []
     start = 0
     while start < len(content):
@@ -239,7 +254,12 @@ def _split_content_into_segments(content: str, max_chars: int) -> List[str]:
             nl = content.rfind("\n", start, end)
             if nl > start:
                 end = nl
-        segments.append(content[start:end].strip())
+        seg = content[start:end].strip()
+        if seg:
+            # For segments after the first, prepend the chapter heading as context
+            if start > 0 and header_line and not seg.startswith(header_line):
+                seg = header_line + "\n" + seg
+            segments.append(seg)
         start = end
     return [s for s in segments if s]
 
@@ -294,8 +314,8 @@ Return the COMPLETE corrected chapter matching AIChapter schema.
                     },
                 ],
                 temperature=0.1,
-                max_tokens=4096,
-                max_retries=3,
+                max_tokens=2048,
+                max_retries=0,
             )
             return AIChapter.model_validate(chapter_obj).model_dump()
         except Exception as e:
@@ -319,8 +339,8 @@ Return the COMPLETE corrected chapter matching AIChapter schema.
                             {"role": "user", "content": user_message},
                         ],
                         temperature=0.1,
-                        max_tokens=4096,
-                        max_retries=3,
+                        max_tokens=2048,
+                        max_retries=0,
                     )
                     return AIChapter.model_validate(chapter_obj).model_dump()
                 except Exception as e2:
@@ -380,15 +400,38 @@ def structure_one(
                 # Accumulate topics from subsequent segments into the merged chapter
                 merged["topics"].extend(seg_result.get("topics", []))
         except Exception as e:
+            safe_msg = str(e).encode("ascii", errors="replace").decode("ascii")
             print(
                 f"  Warning: segment {seg_idx + 1}/{len(segments)} of "
-                f"chapter {chapter_num} failed: {e}"
+                f"chapter {chapter_num} failed: {safe_msg}"
             )
 
     if merged is None:
-        raise RuntimeError(
-            f"All {len(segments)} segments of chapter {chapter_num} failed to process."
+        # All segments failed (e.g. daily rate-limit exhausted).
+        # Return a placeholder so the pipeline saves all previously completed chapters
+        # instead of crashing. The placeholder is easy to identify and re-run.
+        print(
+            f"  ERROR: All {len(segments)} segments of chapter {chapter_num} failed. "
+            f"A placeholder will be written so partial progress is saved."
         )
+        merged = {
+            "chapterNumber": str(chapter_num),
+            "chapterTitle": f"CHAPTER {chapter_num} - REPROCESS REQUIRED",
+            "theme": "Pending",
+            "topics": [
+                {
+                    "title": "Content unavailable",
+                    "source": "ai",
+                    "subtopics": [
+                        {
+                            "title": "Rate limit reached",
+                            "description": "This chapter could not be processed due to API rate limits. Please re-run the pipeline.",
+                            "source": "ai",
+                        }
+                    ],
+                }
+            ],
+        }
 
     return merged
 
